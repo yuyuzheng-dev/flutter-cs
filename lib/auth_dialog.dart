@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
-import 'config.dart';
+import 'config_manager.dart';
 
 class AuthDialogResult {
   final String email;
@@ -18,32 +18,12 @@ class AuthDialogResult {
   });
 }
 
-enum AuthTab { login, register, forgot }
-enum EmailCodeScene { register, resetPassword }
+enum AuthMode { login, register, forgot }
 
-extension _SceneExt on EmailCodeScene {
-  String get value => this == EmailCodeScene.register ? 'register' : 'resetPassword';
-  String get label => this == EmailCodeScene.register ? '注册' : '重置密码';
-}
-
-String _trimSlash(String s) {
-  s = s.trim();
-  while (s.endsWith('/')) s = s.substring(0, s.length - 1);
-  return s;
-}
-
-Uri _apiV1(String pathUnderApiV1) {
-  final api = _trimSlash(AppConfig.apiBaseUrl);
-  if (!pathUnderApiV1.startsWith('/')) pathUnderApiV1 = '/$pathUnderApiV1';
-  return Uri.parse('$api/api/v1$pathUnderApiV1');
-}
-
-String _extractAuthData(dynamic j) {
-  if (j is Map) {
-    final data = j['data'];
-    if (data is Map && data['auth_data'] != null) return '${data['auth_data']}';
-    if (data is Map && data['token'] != null) return 'Bearer ${data['token']}';
-  }
+String _extractAuthData(Map<String, dynamic> j) {
+  final data = j['data'];
+  if (data is Map && data['auth_data'] != null) return '${data['auth_data']}';
+  if (data is Map && data['token'] != null) return 'Bearer ${data['token']}';
   return '';
 }
 
@@ -53,11 +33,19 @@ String _extractSessionCookie(String? setCookie) {
   return m?.group(1) ?? '';
 }
 
+Uri _apiV1(String pathUnderApiV1) {
+  final base = ConfigManager.I.apiBaseUrl;
+  final prefix = ConfigManager.I.apiPrefix;
+  var p = pathUnderApiV1;
+  if (!p.startsWith('/')) p = '/$p';
+  return Uri.parse('$base$prefix$p');
+}
+
 class GuestConfig {
   final int isEmailVerify; // 0/1
-  final List<String> emailSuffixes; // whitelist
+  final List<String> emailWhitelistSuffix; // 为空表示 email_whitelist_suffix=0 或不是数组
 
-  const GuestConfig({required this.isEmailVerify, required this.emailSuffixes});
+  const GuestConfig({required this.isEmailVerify, required this.emailWhitelistSuffix});
 
   static GuestConfig? fromJson(dynamic j) {
     if (j is! Map) return null;
@@ -70,18 +58,20 @@ class GuestConfig {
       return int.tryParse(v?.toString() ?? '') ?? 0;
     }
 
-    List<String> suffixes = [];
+    final isEmailVerify = toInt(data['is_email_verify']);
+
+    // 关键：email_whitelist_suffix 可能是 0 或 List
     final raw = data['email_whitelist_suffix'];
+    List<String> suffixes = [];
     if (raw is List) {
       suffixes = raw.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).toList();
       suffixes = suffixes.toSet().toList();
       suffixes.sort();
+    } else {
+      suffixes = [];
     }
 
-    return GuestConfig(
-      isEmailVerify: toInt(data['is_email_verify']),
-      emailSuffixes: suffixes,
-    );
+    return GuestConfig(isEmailVerify: isEmailVerify, emailWhitelistSuffix: suffixes);
   }
 }
 
@@ -91,7 +81,8 @@ class XBoardAuthDialog {
     String initialEmail = '',
     String initialPassword = '',
     bool forceLogin = false,
-  }) {
+  }) async {
+    await ConfigManager.I.init();
     return showDialog<AuthDialogResult>(
       context: context,
       barrierDismissible: false,
@@ -120,77 +111,117 @@ class _AuthDialog extends StatefulWidget {
 }
 
 class _AuthDialogState extends State<_AuthDialog> {
-  AuthTab tab = AuthTab.login;
+  AuthMode mode = AuthMode.login;
 
-  // 动态邮箱 UI
-  final emailPrefixCtrl = TextEditingController();
+  // 登录/找回：完整邮箱输入
   final emailFullCtrl = TextEditingController();
+
+  // 注册：若有白名单后缀，则用前缀+下拉
+  final emailPrefixCtrl = TextEditingController();
   String selectedSuffix = '';
 
   final pwdCtrl = TextEditingController();
-
   final inviteCtrl = TextEditingController();
   final emailCodeCtrl = TextEditingController();
 
-  EmailCodeScene codeScene = EmailCodeScene.register;
-
   bool loading = false;
-  String? errText;
 
+  // 联通检测状态
+  bool configLoading = true;
   bool configOk = false;
   GuestConfig? guestConfig;
+  String? errText;
+
+  bool get _registerHasWhitelistSuffix =>
+      (guestConfig?.emailWhitelistSuffix.isNotEmpty ?? false);
 
   @override
   void initState() {
     super.initState();
     emailFullCtrl.text = widget.initialEmail.trim();
     pwdCtrl.text = widget.initialPassword;
-
-    WidgetsBinding.instance.addPostFrameCallback((_) => _loadGuestConfig());
+    _recheckAndLoadGuestConfig();
   }
 
   @override
   void dispose() {
-    emailPrefixCtrl.dispose();
     emailFullCtrl.dispose();
+    emailPrefixCtrl.dispose();
     pwdCtrl.dispose();
     inviteCtrl.dispose();
     emailCodeCtrl.dispose();
     super.dispose();
   }
 
-  Future<void> _loadGuestConfig() async {
+  Future<Map<String, dynamic>> _parseJson(http.Response resp) async {
+    try {
+      final decoded = jsonDecode(resp.body);
+      if (decoded is Map<String, dynamic>) return decoded;
+      throw Exception('Unexpected JSON type');
+    } catch (_) {
+      throw Exception('后端返回不是 JSON：HTTP ${resp.statusCode}\n${resp.body}');
+    }
+  }
+
+  String _formatApiError(Map<String, dynamic> j, int statusCode) {
+    final msg = j['message']?.toString() ?? 'HTTP $statusCode';
+    final errs = j['errors'];
+    if (errs == null) return msg;
+    return '$msg\n$errs';
+  }
+
+  // 注册邮箱：强制白名单后缀
+  String _currentEmailForRegister() {
+    if (!_registerHasWhitelistSuffix) return emailFullCtrl.text.trim();
+    final prefix = emailPrefixCtrl.text.trim();
+    final suffix = selectedSuffix.trim();
+    if (prefix.isEmpty || suffix.isEmpty) return '';
+    return '$prefix@$suffix';
+  }
+
+  // 登录/找回：不限制后缀（按你要求“注册才限制”）
+  String _currentEmailNormal() => emailFullCtrl.text.trim();
+
+  Future<void> _recheckAndLoadGuestConfig() async {
     setState(() {
-      loading = true;
-      errText = null;
+      configLoading = true;
       configOk = false;
       guestConfig = null;
+      errText = null;
     });
 
     try {
+      // 先拉远程 config + 竞速选最快域名
+      await ConfigManager.I.refreshRemoteConfigAndRace();
+      if (!ConfigManager.I.ready) {
+        throw Exception('没有可用域名（远程配置/兜底域名都为空或不可用）');
+      }
+
+      // 再用“已选最快域名”请求 guest config
       final resp = await http
           .get(_apiV1('/guest/comm/config'), headers: const {'Accept': 'application/json'})
           .timeout(const Duration(seconds: 12));
 
+      final j = await _parseJson(resp);
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        throw Exception('config 不通：HTTP ${resp.statusCode}');
+        throw Exception(_formatApiError(j, resp.statusCode));
       }
 
-      final j = jsonDecode(resp.body);
       final cfg = GuestConfig.fromJson(j);
-      if (cfg == null) throw Exception('config 返回格式异常');
+      if (cfg == null) throw Exception('返回格式异常');
 
-      // 若启用邮箱后缀白名单：自动拆分邮箱
-      if (cfg.isEmailVerify == 1 && cfg.emailSuffixes.isNotEmpty) {
+      // 如果注册白名单存在，初始化 selectedSuffix
+      if (cfg.emailWhitelistSuffix.isNotEmpty) {
+        // 尝试从 emailFull 拆分
         final full = emailFullCtrl.text.trim();
         if (full.contains('@')) {
           final parts = full.split('@');
           emailPrefixCtrl.text = parts.first;
           final suf = parts.length > 1 ? parts.last : '';
-          selectedSuffix = cfg.emailSuffixes.contains(suf) ? suf : cfg.emailSuffixes.first;
+          selectedSuffix = cfg.emailWhitelistSuffix.contains(suf) ? suf : cfg.emailWhitelistSuffix.first;
         } else {
           emailPrefixCtrl.text = full;
-          selectedSuffix = cfg.emailSuffixes.first;
+          selectedSuffix = cfg.emailWhitelistSuffix.first;
         }
       }
 
@@ -200,73 +231,47 @@ class _AuthDialogState extends State<_AuthDialog> {
       });
     } catch (e) {
       setState(() {
-        errText = '联通检测失败：$e\n（此接口无需认证，不通说明网站/API 有问题）';
+        errText = '联通检测失败：$e';
         configOk = false;
       });
     } finally {
-      setState(() => loading = false);
+      setState(() => configLoading = false);
     }
-  }
-
-  String _currentEmail() {
-    final cfg = guestConfig;
-    if (cfg != null && cfg.isEmailVerify == 1 && cfg.emailSuffixes.isNotEmpty) {
-      final prefix = emailPrefixCtrl.text.trim();
-      final suffix = selectedSuffix.trim();
-      if (prefix.isEmpty || suffix.isEmpty) return '';
-      return '$prefix@$suffix';
-    }
-    return emailFullCtrl.text.trim();
-  }
-
-  Future<Map<String, dynamic>> _postJson(String pathUnderApiV1, Map<String, dynamic> body) async {
-    final resp = await http
-        .post(
-          _apiV1(pathUnderApiV1),
-          headers: const {'Accept': 'application/json', 'Content-Type': 'application/json'},
-          body: jsonEncode(body),
-        )
-        .timeout(const Duration(seconds: 20));
-
-    Map<String, dynamic> j;
-    try {
-      final parsed = jsonDecode(resp.body);
-      if (parsed is Map<String, dynamic>) {
-        j = parsed;
-      } else {
-        throw Exception('Unexpected JSON type');
-      }
-    } catch (_) {
-      throw Exception('后端返回不是 JSON：HTTP ${resp.statusCode}\n${resp.body}');
-    }
-
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      final msg = j['message']?.toString() ?? 'HTTP ${resp.statusCode}';
-      final errs = j['errors']?.toString() ?? '';
-      throw Exception(errs.isEmpty ? msg : '$msg\n$errs');
-    }
-    return j;
   }
 
   Future<void> _sendEmailCode() async {
+    // 自动场景：注册 register，找回 resetPassword
+    final scene = (mode == AuthMode.forgot) ? 'resetPassword' : 'register';
+
     setState(() {
       loading = true;
       errText = null;
     });
+
     try {
-      if (!configOk) throw Exception('config 未联通，无法继续');
-      final email = _currentEmail();
+      if (!configOk) throw Exception('联通检测未通过');
+
+      final email = (mode == AuthMode.register)
+          ? _currentEmailForRegister()
+          : _currentEmailNormal();
+
       if (email.isEmpty) throw Exception('请输入邮箱');
 
-      await _postJson('/passport/auth/sendEmailCode', {
-        'email': email,
-        'scene': codeScene.value,
-      });
+      final resp = await http
+          .post(
+            _apiV1('/passport/auth/sendEmailCode'),
+            headers: const {'Accept': 'application/json', 'Content-Type': 'application/json'},
+            body: jsonEncode({'email': email, 'scene': scene}),
+          )
+          .timeout(const Duration(seconds: 20));
+
+      final j = await _parseJson(resp);
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception(_formatApiError(j, resp.statusCode));
+      }
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('验证码已发送（场景：${codeScene.label}）')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('验证码已发送（$scene）')));
     } catch (e) {
       setState(() => errText = '错误：$e');
     } finally {
@@ -279,10 +284,11 @@ class _AuthDialogState extends State<_AuthDialog> {
       loading = true;
       errText = null;
     });
-    try {
-      if (!configOk) throw Exception('config 未联通，无法继续');
 
-      final email = _currentEmail();
+    try {
+      if (!configOk) throw Exception('联通检测未通过');
+
+      final email = _currentEmailNormal();
       final pwd = pwdCtrl.text;
       if (email.isEmpty || pwd.isEmpty) throw Exception('请输入邮箱和密码');
 
@@ -294,33 +300,23 @@ class _AuthDialogState extends State<_AuthDialog> {
           )
           .timeout(const Duration(seconds: 20));
 
-      Map<String, dynamic> j;
-      try {
-        final parsed = jsonDecode(resp.body);
-        if (parsed is Map<String, dynamic>) {
-          j = parsed;
-        } else {
-          throw Exception('Unexpected JSON type');
-        }
-      } catch (_) {
-        throw Exception('后端返回不是 JSON：HTTP ${resp.statusCode}\n${resp.body}');
-      }
-
+      final j = await _parseJson(resp);
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        final msg = j['message']?.toString() ?? 'HTTP ${resp.statusCode}';
-        final errs = j['errors']?.toString() ?? '';
-        throw Exception(errs.isEmpty ? msg : '$msg\n$errs');
+        throw Exception(_formatApiError(j, resp.statusCode));
       }
 
       final authData = _extractAuthData(j);
-      if (authData.isEmpty) throw Exception('登录成功但未找到 data.auth_data');
+      if (authData.isEmpty) throw Exception('登录成功但缺少 data.auth_data');
 
       final cookie = _extractSessionCookie(resp.headers['set-cookie']);
 
       if (!mounted) return;
-      Navigator.of(context).pop(
-        AuthDialogResult(email: email, password: pwd, authData: authData, cookie: cookie),
-      );
+      Navigator.of(context).pop(AuthDialogResult(
+        email: email,
+        password: pwd,
+        authData: authData,
+        cookie: cookie,
+      ));
     } catch (e) {
       setState(() => errText = '错误：$e');
     } finally {
@@ -333,26 +329,48 @@ class _AuthDialogState extends State<_AuthDialog> {
       loading = true;
       errText = null;
     });
-    try {
-      if (!configOk) throw Exception('config 未联通，无法继续');
 
-      final email = _currentEmail();
+    try {
+      if (!configOk) throw Exception('联通检测未通过');
+
+      final email = _currentEmailForRegister();
       final pwd = pwdCtrl.text;
       if (email.isEmpty || pwd.isEmpty) throw Exception('请输入邮箱和密码');
 
+      // 强制：如果有白名单后缀，则必须在列表里
+      if (_registerHasWhitelistSuffix) {
+        final suffix = email.split('@').length > 1 ? email.split('@').last : '';
+        if (!(guestConfig?.emailWhitelistSuffix.contains(suffix) ?? false)) {
+          throw Exception('邮箱后缀不在白名单内');
+        }
+      }
+
       final invite = inviteCtrl.text.trim();
 
-      await _postJson('/passport/auth/register', {
-        'email': email,
-        'password': pwd,
-        if (invite.isNotEmpty) 'invite_code': invite,
-      });
+      final resp = await http
+          .post(
+            _apiV1('/passport/auth/register'),
+            headers: const {'Accept': 'application/json', 'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'email': email,
+              'password': pwd,
+              if (invite.isNotEmpty) 'invite_code': invite,
+            }),
+          )
+          .timeout(const Duration(seconds: 20));
+
+      final j = await _parseJson(resp);
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception(_formatApiError(j, resp.statusCode));
+      }
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('注册成功，正在登录…')));
+      // 注册成功后直接登录返回 token/auth_data（按你之前接口）
       await _login();
     } catch (e) {
       setState(() => errText = '错误：$e');
+    } finally {
       setState(() => loading = false);
     }
   }
@@ -362,98 +380,156 @@ class _AuthDialogState extends State<_AuthDialog> {
       loading = true;
       errText = null;
     });
-    try {
-      if (!configOk) throw Exception('config 未联通，无法继续');
 
-      final email = _currentEmail();
+    try {
+      if (!configOk) throw Exception('联通检测未通过');
+
+      final email = _currentEmailNormal();
       final pwd = pwdCtrl.text;
       final code = emailCodeCtrl.text.trim();
+
       if (email.isEmpty) throw Exception('请输入邮箱');
       if (pwd.isEmpty) throw Exception('请输入新密码');
       if (code.isEmpty) throw Exception('请输入邮箱验证码');
 
-      await _postJson('/passport/auth/resetPassword', {
-        'email': email,
-        'password': pwd,
-        'email_code': code,
-      });
+      final resp = await http
+          .post(
+            _apiV1('/passport/auth/resetPassword'),
+            headers: const {'Accept': 'application/json', 'Content-Type': 'application/json'},
+            body: jsonEncode({'email': email, 'password': pwd, 'email_code': code}),
+          )
+          .timeout(const Duration(seconds: 20));
+
+      final j = await _parseJson(resp);
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception(_formatApiError(j, resp.statusCode));
+      }
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('重置成功，正在登录…')));
       await _login();
     } catch (e) {
       setState(() => errText = '错误：$e');
+    } finally {
       setState(() => loading = false);
     }
   }
 
+  // 你原规则：is_email_verify=0 => 注册不显示发送验证码
+  bool get _showSendCodeInRegister =>
+      mode == AuthMode.register && (guestConfig?.isEmailVerify == 1);
+
+  bool get _showSendCodeInForgot => mode == AuthMode.forgot;
+
   @override
   Widget build(BuildContext context) {
-    final cfg = guestConfig;
-    final useSuffixUi = (cfg != null && cfg.isEmailVerify == 1 && cfg.emailSuffixes.isNotEmpty);
+    final title = switch (mode) {
+      AuthMode.login => '登录',
+      AuthMode.register => '注册',
+      AuthMode.forgot => '找回密码',
+    };
+
+    final canInteract = configOk && !loading && !configLoading;
 
     return AlertDialog(
       title: Row(
         children: [
-          Expanded(child: Text(switch (tab) { AuthTab.login => '登录', AuthTab.register => '注册', AuthTab.forgot => '忘记密码' })),
+          Expanded(child: Text(title)),
           IconButton(
-            tooltip: '重新检测联通',
-            onPressed: loading ? null : _loadGuestConfig,
-            icon: Icon(configOk ? Icons.verified : Icons.error_outline, color: configOk ? Colors.green : Colors.red),
+            tooltip: '重新检测（竞速选最快域名）',
+            onPressed: (loading || configLoading) ? null : _recheckAndLoadGuestConfig,
+            icon: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 200),
+              child: configLoading
+                  ? const SizedBox(
+                      key: ValueKey('spin'),
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(
+                      configOk ? Icons.verified : Icons.error_outline,
+                      key: ValueKey('status'),
+                      color: configOk ? Colors.green : Colors.red,
+                    ),
+            ),
           ),
         ],
       ),
       content: SingleChildScrollView(
         child: SizedBox(
-          width: 440,
+          width: 420,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // 只展示，不可编辑
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  '网站：${AppConfig.siteBaseUrl}\nAPI：${AppConfig.apiBaseUrl}',
-                  style: const TextStyle(fontSize: 12, color: Colors.black54),
-                ),
-              ),
-              const SizedBox(height: 10),
-
-              SegmentedButton<AuthTab>(
-                segments: const [
-                  ButtonSegment(value: AuthTab.login, label: Text('登录')),
-                  ButtonSegment(value: AuthTab.register, label: Text('注册')),
-                  ButtonSegment(value: AuthTab.forgot, label: Text('忘记密码')),
-                ],
-                selected: {tab},
-                onSelectionChanged: loading
-                    ? null
-                    : (s) {
-                        setState(() {
-                          tab = s.first;
-                          errText = null;
-                          codeScene = (tab == AuthTab.forgot) ? EmailCodeScene.resetPassword : EmailCodeScene.register;
-                        });
-                      },
+              // 联通检测动画区
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 200),
+                child: configLoading
+                    ? Container(
+                        key: const ValueKey('checking'),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.black12),
+                        ),
+                        child: Row(
+                          children: const [
+                            SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                            SizedBox(width: 10),
+                            Expanded(child: Text('正在检测网站联通性（竞速选最快域名）…')),
+                          ],
+                        ),
+                      )
+                    : Container(
+                        key: const ValueKey('checked'),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.black12),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(configOk ? Icons.check_circle : Icons.cancel,
+                                color: configOk ? Colors.green : Colors.red),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                configOk ? '联通正常' : '联通异常（站点/API 可能有问题）',
+                                style: TextStyle(color: configOk ? Colors.green : Colors.red),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
               ),
               const SizedBox(height: 12),
 
-              // 动态邮箱输入
-              if (useSuffixUi) ...[
+              // 邮箱输入：
+              // - 登录/找回：完整输入
+              // - 注册：如果 email_whitelist_suffix 是数组则强制前缀+下拉
+              if (mode == AuthMode.register && _registerHasWhitelistSuffix) ...[
                 Row(
                   children: [
                     Expanded(
                       child: TextField(
                         controller: emailPrefixCtrl,
+                        enabled: !loading && !configLoading,
                         decoration: const InputDecoration(labelText: '邮箱前缀'),
                       ),
                     ),
                     const SizedBox(width: 10),
                     Expanded(
                       child: DropdownButtonFormField<String>(
-                        value: (selectedSuffix.isNotEmpty) ? selectedSuffix : cfg!.emailSuffixes.first,
-                        items: cfg!.emailSuffixes.map((s) => DropdownMenuItem(value: s, child: Text('@$s'))).toList(),
-                        onChanged: loading ? null : (v) => setState(() => selectedSuffix = v ?? selectedSuffix),
+                        value: (selectedSuffix.isNotEmpty)
+                            ? selectedSuffix
+                            : (guestConfig!.emailWhitelistSuffix.isNotEmpty ? guestConfig!.emailWhitelistSuffix.first : ''),
+                        items: guestConfig!.emailWhitelistSuffix
+                            .map((s) => DropdownMenuItem(value: s, child: Text('@$s')))
+                            .toList(),
+                        onChanged: (!loading && !configLoading)
+                            ? (v) => setState(() => selectedSuffix = v ?? selectedSuffix)
+                            : null,
                         decoration: const InputDecoration(labelText: '邮箱后缀'),
                       ),
                     ),
@@ -462,6 +538,7 @@ class _AuthDialogState extends State<_AuthDialog> {
               ] else ...[
                 TextField(
                   controller: emailFullCtrl,
+                  enabled: !loading && !configLoading,
                   decoration: const InputDecoration(labelText: '邮箱'),
                   keyboardType: TextInputType.emailAddress,
                 ),
@@ -471,59 +548,39 @@ class _AuthDialogState extends State<_AuthDialog> {
 
               TextField(
                 controller: pwdCtrl,
-                decoration: InputDecoration(labelText: tab == AuthTab.forgot ? '新密码' : '密码'),
+                enabled: !loading && !configLoading,
+                decoration: InputDecoration(labelText: mode == AuthMode.forgot ? '新密码' : '密码'),
                 obscureText: true,
               ),
 
-              if (tab == AuthTab.register) ...[
+              if (mode == AuthMode.register) ...[
                 const SizedBox(height: 10),
-                TextField(controller: inviteCtrl, decoration: const InputDecoration(labelText: '邀请码（可选）')),
-              ],
-
-              if (tab == AuthTab.forgot) ...[
-                const SizedBox(height: 10),
-                TextField(controller: emailCodeCtrl, decoration: const InputDecoration(labelText: '邮箱验证码')),
-              ],
-
-              if (tab != AuthTab.login) ...[
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: DropdownButtonFormField<EmailCodeScene>(
-                        value: codeScene,
-                        items: const [
-                          DropdownMenuItem(value: EmailCodeScene.register, child: Text('验证码场景：注册')),
-                          DropdownMenuItem(value: EmailCodeScene.resetPassword, child: Text('验证码场景：重置密码')),
-                        ],
-                        onChanged: loading ? null : (v) => setState(() => codeScene = v ?? codeScene),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    ElevatedButton(
-                      onPressed: (!configOk || loading) ? null : _sendEmailCode,
-                      child: Text(loading ? '发送中…' : '发送验证码'),
-                    ),
-                  ],
+                TextField(
+                  controller: inviteCtrl,
+                  enabled: !loading && !configLoading,
+                  decoration: const InputDecoration(labelText: '邀请码（可选）'),
                 ),
               ],
 
-              const SizedBox(height: 8),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  configOk ? '✅ config 联通正常（无需认证）' : '❌ config 不通：网站/API 可能有问题',
-                  style: TextStyle(color: configOk ? Colors.green : Colors.red),
+              if (mode == AuthMode.forgot) ...[
+                const SizedBox(height: 10),
+                TextField(
+                  controller: emailCodeCtrl,
+                  enabled: !loading && !configLoading,
+                  decoration: const InputDecoration(labelText: '邮箱验证码'),
                 ),
-              ),
+              ],
 
-              if (cfg != null) ...[
-                const SizedBox(height: 6),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    'is_email_verify=${cfg.isEmailVerify}  suffixes=${cfg.emailSuffixes.length}',
-                    style: const TextStyle(fontSize: 12, color: Colors.black54),
+              // 发送验证码按钮：
+              // - 注册：仅 is_email_verify=1 才显示（你要求）
+              // - 找回：一直显示（因为 resetPassword 需要 email_code）
+              if (_showSendCodeInRegister || _showSendCodeInForgot) ...[
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: canInteract ? _sendEmailCode : null,
+                    child: Text(loading ? '发送中…' : '发送邮箱验证码'),
                   ),
                 ),
               ],
@@ -540,19 +597,58 @@ class _AuthDialogState extends State<_AuthDialog> {
                   child: Text(errText!, style: const TextStyle(color: Colors.red)),
                 ),
               ],
+
+              const SizedBox(height: 8),
+
+              // 底部导航：默认登录；左下找回；右下注册
+              Row(
+                children: [
+                  TextButton(
+                    onPressed: (loading || configLoading)
+                        ? null
+                        : () => setState(() {
+                              mode = AuthMode.forgot;
+                              errText = null;
+                            }),
+                    child: const Text('找回密码'),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: (loading || configLoading)
+                        ? null
+                        : () => setState(() {
+                              mode = AuthMode.register;
+                              errText = null;
+                            }),
+                    child: const Text('注册'),
+                  ),
+                ],
+              ),
             ],
           ),
         ),
       ),
       actions: [
         if (!widget.forceLogin)
-          TextButton(onPressed: loading ? null : () => Navigator.of(context).pop(null), child: const Text('关闭')),
-        if (tab == AuthTab.login)
-          ElevatedButton(onPressed: (!configOk || loading) ? null : _login, child: Text(loading ? '处理中…' : '登录')),
-        if (tab == AuthTab.register)
-          ElevatedButton(onPressed: (!configOk || loading) ? null : _register, child: Text(loading ? '处理中…' : '注册并登录')),
-        if (tab == AuthTab.forgot)
-          ElevatedButton(onPressed: (!configOk || loading) ? null : _resetPassword, child: Text(loading ? '处理中…' : '重置并登录')),
+          TextButton(
+            onPressed: (loading || configLoading) ? null : () => Navigator.of(context).pop(null),
+            child: const Text('关闭'),
+          ),
+        if (mode == AuthMode.login)
+          ElevatedButton(
+            onPressed: canInteract ? _login : null,
+            child: Text(loading ? '处理中…' : '登录'),
+          ),
+        if (mode == AuthMode.register)
+          ElevatedButton(
+            onPressed: canInteract ? _register : null,
+            child: Text(loading ? '处理中…' : '注册并登录'),
+          ),
+        if (mode == AuthMode.forgot)
+          ElevatedButton(
+            onPressed: canInteract ? _resetPassword : null,
+            child: Text(loading ? '处理中…' : '重置并登录'),
+          ),
       ],
     );
   }
