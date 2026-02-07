@@ -26,23 +26,23 @@ jobs:
           channel: "stable"
           cache: true
 
-      - name: Show repo files
+      - name: Create clean flutter app and inject code
         run: |
-          echo "== repo root =="
-          ls -la
-          echo "== lib =="
-          ls -la lib || true
-          echo "== pubspec =="
-          test -f pubspec.yaml && cat pubspec.yaml || (echo "pubspec.yaml missing" && exit 1)
-
-      # ✅ 关键：在 CI 里生成一个干净的 Flutter app 模板
-      - name: Create clean flutter app
-        run: |
+          set -e
+          # 生成干净模板（标准 android/gradle 结构）
           flutter create -t app clean_app --org com.example --project-name xboard_onefile
+
+          # 用你仓库里的 Dart + pubspec 覆盖进去
           rm -rf clean_app/lib
           rm -f clean_app/pubspec.yaml
           cp -r lib clean_app/lib
           cp pubspec.yaml clean_app/pubspec.yaml
+
+          # 关键：把你仓库的 AndroidManifest 也覆盖进去（确保 INTERNET 权限生效）
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            mkdir -p clean_app/android/app/src/main
+            cp android/app/src/main/AndroidManifest.xml clean_app/android/app/src/main/AndroidManifest.xml
+          fi
 
       - name: Pub get
         working-directory: clean_app
