@@ -64,13 +64,13 @@ String _extractSessionCookie(String? setCookie) {
 
 /// ==================== 历史登录数据模型 ====================
 class LoginProfile {
-  final String id; // 用于唯一标识（简单用 baseUrl|email 的 hash）
+  final String id; // baseUrl|email hash
   final String baseUrl;
   final String email;
   final String authData; // "Bearer xxxx"
   final String cookie; // server_name_session=...
   final String lastSubscribeUrl;
-  final int savedAtMs; // 时间戳
+  final int savedAtMs;
 
   const LoginProfile({
     required this.id,
@@ -129,7 +129,6 @@ class LoginProfile {
 }
 
 String _makeProfileId(String baseUrl, String email) {
-  // 够用即可：避免重复（同站点同邮箱覆盖）
   final s = '${baseUrl.toLowerCase()}|${email.toLowerCase()}';
   return s.codeUnits.fold<int>(0, (a, b) => (a * 131 + b) & 0x7fffffff).toString();
 }
@@ -140,6 +139,10 @@ class Store {
   static const _kCurrentAuthData = 'current_authData';
   static const _kCurrentCookie = 'current_cookie';
   static const _kCurrentLastSubscribeUrl = 'current_lastSubscribeUrl';
+
+  // ✅ 当前正在使用的历史 profile id（用于精准同步历史）
+  static const _kCurrentProfileId = 'current_profile_id';
+
   static const _kProfiles = 'profiles_json'; // List<LoginProfile>
 
   static Future<SharedPreferences> _sp() => SharedPreferences.getInstance();
@@ -163,6 +166,9 @@ class Store {
   static Future<String> getCurrentLastSubscribeUrl() async =>
       (await _sp()).getString(_kCurrentLastSubscribeUrl) ?? '';
 
+  static Future<void> saveCurrentProfileId(String v) async => (await _sp()).setString(_kCurrentProfileId, v);
+  static Future<String> getCurrentProfileId() async => (await _sp()).getString(_kCurrentProfileId) ?? '';
+
   static Future<List<LoginProfile>> loadProfiles() async {
     final sp = await _sp();
     final s = sp.getString(_kProfiles);
@@ -175,7 +181,6 @@ class Store {
           final p = LoginProfile.fromJson(it);
           if (p != null) out.add(p);
         }
-        // 新的在前
         out.sort((a, b) => b.savedAtMs.compareTo(a.savedAtMs));
         return out;
       }
@@ -189,7 +194,6 @@ class Store {
     await sp.setString(_kProfiles, jsonEncode(list));
   }
 
-  /// 新增或覆盖（同 id 覆盖）
   static Future<void> upsertProfile(LoginProfile p) async {
     final profiles = await loadProfiles();
     final idx = profiles.indexWhere((x) => x.id == p.id);
@@ -206,11 +210,17 @@ class Store {
     final profiles = await loadProfiles();
     profiles.removeWhere((x) => x.id == id);
     await saveProfiles(profiles);
+
+    final cur = await getCurrentProfileId();
+    if (cur == id) {
+      await saveCurrentProfileId('');
+    }
   }
 
   static Future<void> clearProfiles() async {
     final sp = await _sp();
     await sp.remove(_kProfiles);
+    await sp.remove(_kCurrentProfileId);
   }
 
   static Future<void> clearAll() async {
@@ -219,6 +229,7 @@ class Store {
     await sp.remove(_kCurrentAuthData);
     await sp.remove(_kCurrentCookie);
     await sp.remove(_kCurrentLastSubscribeUrl);
+    await sp.remove(_kCurrentProfileId);
     await sp.remove(_kProfiles);
   }
 }
@@ -252,6 +263,8 @@ class _HomeState extends State<Home> {
 
   List<LoginProfile> profiles = [];
 
+  int lastFetchedAtMs = 0;
+
   @override
   void initState() {
     super.initState();
@@ -284,7 +297,7 @@ class _HomeState extends State<Home> {
       profiles = ps;
     });
 
-    // 有 authData 就自动刷新一次订阅
+    // 有 authData 就自动刷新一次订阅（确保是“最新”）
     if (a.isNotEmpty && base.isNotEmpty) {
       await fetchSubscribe(showToast: false);
     }
@@ -293,6 +306,73 @@ class _HomeState extends State<Home> {
   Future<void> _reloadProfiles() async {
     final ps = await Store.loadProfiles();
     setState(() => profiles = ps);
+  }
+
+  String _fmtTime(int ms) {
+    if (ms <= 0) return '-';
+    final dt = DateTime.fromMillisecondsSinceEpoch(ms);
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${dt.year}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}';
+  }
+
+  Future<void> _updateCurrentAndHistorySubscribe({
+    required String subUrl,
+    String? newCookie,
+  }) async {
+    final base = _normBaseUrl(baseUrlCtrl.text);
+    final a = authData ?? await Store.getCurrentAuthData();
+    final c = (newCookie != null && newCookie.isNotEmpty) ? newCookie : (cookie ?? await Store.getCurrentCookie());
+
+    // 更新 UI
+    setState(() {
+      lastSubscribeUrl = subUrl;
+      if (c.isNotEmpty) cookie = c;
+      lastFetchedAtMs = DateTime.now().millisecondsSinceEpoch;
+    });
+
+    // 更新 current
+    await Store.saveCurrent(baseUrl: base, authData: a, cookie: c, lastSubscribeUrl: subUrl);
+
+    // 更新历史（用 current_profile_id 精准更新）
+    final currentPid = await Store.getCurrentProfileId();
+    if (currentPid.isNotEmpty) {
+      final ps = await Store.loadProfiles();
+      final idx = ps.indexWhere((x) => x.id == currentPid);
+      if (idx >= 0) {
+        ps[idx] = ps[idx].copyWith(
+          lastSubscribeUrl: subUrl,
+          cookie: c,
+          savedAtMs: DateTime.now().millisecondsSinceEpoch,
+          authData: a,
+        );
+        await Store.saveProfiles(ps);
+        await _reloadProfiles();
+      }
+    }
+  }
+
+  /// ✅ 关键：从任意响应里（比如 callApi）同步 subscribe_url 到“订阅链接”区域
+  Future<void> _trySyncSubscribeFromResponse({
+    required String requestPath,
+    required int statusCode,
+    required String responseBody,
+    String? setCookieHeader,
+  }) async {
+    if (statusCode < 200 || statusCode >= 300) return;
+
+    // 只对 getSubscribe 做同步（包含可能的 query/参数）
+    if (!requestPath.contains('/api/v1/user/getSubscribe')) return;
+
+    try {
+      final j = jsonDecode(responseBody);
+      final sub = _extractSubscribeUrl(j);
+      if (sub.isEmpty) return;
+
+      final c = _extractSessionCookie(setCookieHeader);
+      await _updateCurrentAndHistorySubscribe(subUrl: sub, newCookie: c.isNotEmpty ? c : null);
+    } catch (_) {
+      // ignore
+    }
   }
 
   Future<void> loginAndPersist() async {
@@ -340,17 +420,21 @@ class _HomeState extends State<Home> {
 
       final c = _extractSessionCookie(resp.headers['set-cookie']);
 
-      // 先写当前
+      // 生成 profile id（同站点同邮箱覆盖）
+      final pid = _makeProfileId(base, email);
+
+      // 保存当前
       await Store.saveCurrent(
         baseUrl: base,
         authData: a,
         cookie: c,
         lastSubscribeUrl: (lastSubscribeUrl ?? ''),
       );
+      await Store.saveCurrentProfileId(pid);
 
-      // 写历史（覆盖同站点同邮箱）
+      // 写历史
       final profile = LoginProfile(
-        id: _makeProfileId(base, email),
+        id: pid,
         baseUrl: base,
         email: email,
         authData: a,
@@ -393,10 +477,9 @@ class _HomeState extends State<Home> {
 
       final headers = <String, String>{
         'Accept': 'application/json',
-        'Authorization': a, // ✅ auth_data 原样
+        'Authorization': a,
       };
 
-      // 可选带 cookie
       final c = cookie ?? await Store.getCurrentCookie();
       if (c.isNotEmpty) headers['Cookie'] = c;
 
@@ -412,38 +495,13 @@ class _HomeState extends State<Home> {
         throw Exception('获取订阅失败：HTTP ${resp.statusCode}');
       }
 
-      final j = jsonDecode(resp.body);
-      final sub = _extractSubscribeUrl(j);
-      if (sub.isEmpty) throw Exception('返回里未找到 data.subscribe_url');
-
-      // 更新 cookie（有些接口也会刷新）
-      final newCookie = _extractSessionCookie(resp.headers['set-cookie']);
-      final finalCookie = newCookie.isNotEmpty ? newCookie : (c.isNotEmpty ? c : '');
-
-      // 保存当前
-      await Store.saveCurrent(baseUrl: base, authData: a, cookie: finalCookie, lastSubscribeUrl: sub);
-
-      setState(() {
-        lastSubscribeUrl = sub;
-        cookie = finalCookie.isEmpty ? null : finalCookie;
-      });
-
-      // 同步更新历史里“当前站点+邮箱”的订阅链接/时间（如果找得到同 baseUrl/email）
-      final email = emailCtrl.text.trim();
-      final pid = _makeProfileId(base, email.isEmpty ? 'unknown' : email);
-      final ps = await Store.loadProfiles();
-      final idx = ps.indexWhere((x) => x.id == pid);
-      if (idx >= 0) {
-        final updated = ps[idx].copyWith(
-          lastSubscribeUrl: sub,
-          cookie: finalCookie,
-          savedAtMs: DateTime.now().millisecondsSinceEpoch,
-          authData: a,
-        );
-        ps[idx] = updated;
-        await Store.saveProfiles(ps);
-        await _reloadProfiles();
-      }
+      // 同步订阅链接（并把 set-cookie 的最新 session 更新进去）
+      await _trySyncSubscribeFromResponse(
+        requestPath: '/api/v1/user/getSubscribe',
+        statusCode: resp.statusCode,
+        responseBody: resp.body,
+        setCookieHeader: resp.headers['set-cookie'],
+      );
 
       if (showToast && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已获取最新订阅链接')));
@@ -509,6 +567,14 @@ class _HomeState extends State<Home> {
         respStatus = resp.statusCode;
         respText = _prettyJsonIfPossible(resp.body);
       });
+
+      // ✅ 关键修复：如果你在“自定义 API”里请求 getSubscribe，也同步订阅链接到上方卡片
+      await _trySyncSubscribeFromResponse(
+        requestPath: path,
+        statusCode: resp.statusCode,
+        responseBody: resp.body,
+        setCookieHeader: resp.headers['set-cookie'],
+      );
     } catch (e) {
       setState(() => respText = 'Exception: $e');
     } finally {
@@ -533,16 +599,15 @@ class _HomeState extends State<Home> {
       respStatus = null;
       respText = null;
       profiles = [];
+      lastFetchedAtMs = 0;
     });
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已清空所有本地数据与历史')));
   }
 
-  /// 选择某个历史账号
   Future<void> useProfile(LoginProfile p) async {
     baseUrlCtrl.text = p.baseUrl;
     emailCtrl.text = p.email;
-    // 密码不保存（安全），留空
     pwdCtrl.text = '';
 
     setState(() {
@@ -557,9 +622,10 @@ class _HomeState extends State<Home> {
       cookie: p.cookie,
       lastSubscribeUrl: p.lastSubscribeUrl,
     );
+    await Store.saveCurrentProfileId(p.id);
 
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已切换到该历史账号，正在刷新订阅…')));
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已切换账号，正在刷新订阅…')));
     await fetchSubscribe(showToast: false);
   }
 
@@ -575,13 +641,6 @@ class _HomeState extends State<Home> {
     await _reloadProfiles();
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已清空历史记录')));
-  }
-
-  String _fmtTime(int ms) {
-    if (ms <= 0) return '-';
-    final dt = DateTime.fromMillisecondsSinceEpoch(ms);
-    String two(int v) => v.toString().padLeft(2, '0');
-    return '${dt.year}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}';
   }
 
   @override
@@ -634,8 +693,10 @@ class _HomeState extends State<Home> {
                 return Card(
                   child: ListTile(
                     title: Text('${p.email.isEmpty ? '(未记录邮箱)' : p.email}  ·  ${p.baseUrl}'),
-                    subtitle: Text('保存时间：${_fmtTime(p.savedAtMs)}'
-                        '${p.lastSubscribeUrl.isNotEmpty ? '\n订阅：${p.lastSubscribeUrl}' : ''}'),
+                    subtitle: Text(
+                      '保存时间：${_fmtTime(p.savedAtMs)}'
+                      '${p.lastSubscribeUrl.isNotEmpty ? '\n订阅：${p.lastSubscribeUrl}' : ''}',
+                    ),
                     isThreeLine: p.lastSubscribeUrl.isNotEmpty,
                     onTap: loading ? null : () => useProfile(p),
                     trailing: IconButton(
@@ -689,6 +750,8 @@ class _HomeState extends State<Home> {
             const SizedBox(height: 8),
             if (lastSubscribeUrl != null && lastSubscribeUrl!.isNotEmpty) ...[
               SelectableText(lastSubscribeUrl!),
+              const SizedBox(height: 6),
+              Text('最后刷新：${_fmtTime(lastFetchedAtMs)}', style: const TextStyle(color: Colors.black54)),
               const SizedBox(height: 10),
               SizedBox(
                 width: double.infinity,
