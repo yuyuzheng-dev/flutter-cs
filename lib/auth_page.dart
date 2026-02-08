@@ -8,7 +8,7 @@ import 'xboard_api.dart';
 enum AuthTab { login, register, reset }
 
 class AuthPage extends StatefulWidget {
-  final bool force; // force=true：未登录不可返回/不可关闭
+  final bool force;
   const AuthPage({super.key, required this.force});
 
   @override
@@ -22,7 +22,7 @@ class _AuthPageState extends State<AuthPage> {
   bool loadingGuest = true;
 
   bool busy = false;
-  String? err;
+  String? msg; // 提示/错误统一输出
 
   // login
   final _loginKey = GlobalKey<FormState>();
@@ -32,20 +32,20 @@ class _AuthPageState extends State<AuthPage> {
 
   // register
   final _regKey = GlobalKey<FormState>();
+  final regEmailPlainCtrl = TextEditingController();
   final regEmailPrefixCtrl = TextEditingController();
   String? regEmailSuffix;
-  final regEmailPlainCtrl = TextEditingController();
+  final regCodeCtrl = TextEditingController();
   final regPwd1Ctrl = TextEditingController();
   final regPwd2Ctrl = TextEditingController();
   final regInviteCtrl = TextEditingController();
-  final regEmailCodeCtrl = TextEditingController();
   bool regPwdTouched = false;
 
   // reset
   final _resetKey = GlobalKey<FormState>();
+  final resetEmailPlainCtrl = TextEditingController();
   final resetEmailPrefixCtrl = TextEditingController();
   String? resetEmailSuffix;
-  final resetEmailPlainCtrl = TextEditingController();
   final resetCodeCtrl = TextEditingController();
   final resetPwd1Ctrl = TextEditingController();
   final resetPwd2Ctrl = TextEditingController();
@@ -57,12 +57,10 @@ class _AuthPageState extends State<AuthPage> {
   void initState() {
     super.initState();
 
-    // 预填登录信息
     loginEmailCtrl.text = XBoardApi.I.email;
     rememberPwd = XBoardApi.I.rememberPassword;
     if (rememberPwd) loginPwdCtrl.text = XBoardApi.I.password;
 
-    // 先把 guest config 从缓存读出来（UI 秒出）
     final cached = AppStorage.I.getJson(AppStorage.kGuestConfigCache);
     if (cached != null) {
       final isEv = (cached['is_email_verify'] is num) ? (cached['is_email_verify'] as num).toInt() : 0;
@@ -83,20 +81,17 @@ class _AuthPageState extends State<AuthPage> {
   void dispose() {
     loginEmailCtrl.dispose();
     loginPwdCtrl.dispose();
-
-    regEmailPrefixCtrl.dispose();
     regEmailPlainCtrl.dispose();
+    regEmailPrefixCtrl.dispose();
+    regCodeCtrl.dispose();
     regPwd1Ctrl.dispose();
     regPwd2Ctrl.dispose();
     regInviteCtrl.dispose();
-    regEmailCodeCtrl.dispose();
-
-    resetEmailPrefixCtrl.dispose();
     resetEmailPlainCtrl.dispose();
+    resetEmailPrefixCtrl.dispose();
     resetCodeCtrl.dispose();
     resetPwd1Ctrl.dispose();
     resetPwd2Ctrl.dispose();
-
     super.dispose();
   }
 
@@ -111,35 +106,27 @@ class _AuthPageState extends State<AuthPage> {
   Future<void> _reloadAll() async {
     setState(() {
       loadingGuest = true;
-      err = null;
+      msg = null;
     });
 
     try {
-      await XBoardApi.I.refreshDomainRacer(); // 重新竞速（刷新按钮也会走这条）
+      await XBoardApi.I.refreshDomainRacer();
       final g = await XBoardApi.I.fetchGuestConfig();
       guest = g;
       await AppStorage.I.setJson(AppStorage.kGuestConfigCache, g.toJson());
-
       if (guest.emailWhitelistSuffix.isNotEmpty) {
         regEmailSuffix ??= guest.emailWhitelistSuffix.first;
         resetEmailSuffix ??= guest.emailWhitelistSuffix.first;
       }
+      msg = '联通正常';
     } catch (e) {
-      // guest 拉不到，不阻塞登录，但会影响注册/找回的动态显示
-      err = '联通检测失败：${e.toString()}';
+      msg = '联通检测失败：$e';
     } finally {
-      if (mounted) {
-        setState(() => loadingGuest = false);
-      }
+      if (mounted) setState(() => loadingGuest = false);
     }
   }
 
-  // ---------- helpers ----------
-  String _buildEmail({
-    required TextEditingController plain,
-    required TextEditingController prefix,
-    required String? suffix,
-  }) {
+  String _buildEmail({required TextEditingController plain, required TextEditingController prefix, required String? suffix}) {
     if (!hasWhitelist) return plain.text.trim();
     final p = prefix.text.trim();
     final s = (suffix ?? '').trim();
@@ -189,7 +176,7 @@ class _AuthPageState extends State<AuthPage> {
         controller: plainCtrl,
         enabled: enabled,
         keyboardType: TextInputType.emailAddress,
-        decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
+        decoration: InputDecoration(labelText: label),
         validator: _vEmailPlain,
       );
     }
@@ -200,7 +187,7 @@ class _AuthPageState extends State<AuthPage> {
           child: TextFormField(
             controller: prefixCtrl,
             enabled: enabled,
-            decoration: const InputDecoration(labelText: '邮箱前缀', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '邮箱前缀'),
             validator: _vEmailPrefix,
           ),
         ),
@@ -213,29 +200,22 @@ class _AuthPageState extends State<AuthPage> {
                 .map((e) => DropdownMenuItem<String>(value: e, child: Text('@$e', overflow: TextOverflow.ellipsis)))
                 .toList(),
             onChanged: enabled ? onSuffixChanged : null,
-            decoration: const InputDecoration(labelText: '后缀', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '后缀'),
           ),
         ),
       ],
     );
   }
 
-  // ---------- actions ----------
   Future<void> _doLogin() async {
     setState(() {
       busy = true;
-      err = null;
+      msg = null;
     });
-
     try {
       if (!_loginKey.currentState!.validate()) return;
 
-      final j = await XBoardApi.I.login(
-        email: loginEmailCtrl.text.trim(),
-        password: loginPwdCtrl.text,
-      );
-
-      // 保存登录（不自动带 cookie，Authorization 足够）
+      final j = await XBoardApi.I.login(email: loginEmailCtrl.text.trim(), password: loginPwdCtrl.text);
       await XBoardApi.I.saveLoginFromResponse(
         loginEmailCtrl.text.trim(),
         loginPwdCtrl.text,
@@ -243,36 +223,29 @@ class _AuthPageState extends State<AuthPage> {
         rememberPwd,
       );
 
-      // 拉订阅 + 缓存
       final sub = await XBoardApi.I.getSubscribe();
       final subData = (sub['data'] is Map) ? Map<String, dynamic>.from(sub['data']) : <String, dynamic>{};
       await AppStorage.I.setJson(AppStorage.kSubscribeCache, subData);
 
       if (!mounted) return;
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => HomePage(initialSubscribeCache: subData)),
-      );
+      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => HomePage(initialSubscribeCache: subData)));
     } catch (e) {
-      setState(() => err = e.toString());
+      setState(() => msg = '登录失败：$e');
     } finally {
       setState(() => busy = false);
     }
   }
 
-  Future<void> _sendCodeForRegister() async {
+  Future<void> _sendCode(String email, String scene) async {
     setState(() {
       busy = true;
-      err = null;
+      msg = null;
     });
     try {
-      if (!_regKey.currentState!.validate()) return;
-      final email = _buildEmail(plain: regEmailPlainCtrl, prefix: regEmailPrefixCtrl, suffix: regEmailSuffix);
-      if (email.isEmpty) throw Exception('邮箱不完整');
-
-      await XBoardApi.I.sendEmailCode(email: email, scene: 'register');
-      setState(() => err = '验证码已发送，请查收邮箱');
+      await XBoardApi.I.sendEmailCode(email: email, scene: scene);
+      setState(() => msg = '验证码已发送，请查收邮箱');
     } catch (e) {
-      setState(() => err = e.toString());
+      setState(() => msg = '发送失败：$e');
     } finally {
       setState(() => busy = false);
     }
@@ -281,51 +254,27 @@ class _AuthPageState extends State<AuthPage> {
   Future<void> _doRegister() async {
     setState(() {
       busy = true;
-      err = null;
+      msg = null;
     });
-
     try {
       if (!_regKey.currentState!.validate()) return;
-
       final email = _buildEmail(plain: regEmailPlainCtrl, prefix: regEmailPrefixCtrl, suffix: regEmailSuffix);
       if (email.isEmpty) throw Exception('邮箱不完整');
-
-      final emailCode = (guest.isEmailVerify == 1) ? regEmailCodeCtrl.text.trim() : null;
 
       await XBoardApi.I.register(
         email: email,
         password: regPwd1Ctrl.text,
         inviteCode: regInviteCtrl.text.trim().isEmpty ? null : regInviteCtrl.text.trim(),
-        emailCode: emailCode,
+        emailCode: guest.isEmailVerify == 1 ? regCodeCtrl.text.trim() : null,
       );
 
-      // 注册成功：不自动登录，回登录
       setState(() {
         tab = AuthTab.login;
-        err = '注册成功，请登录';
+        msg = '注册成功，请登录';
         loginEmailCtrl.text = email;
       });
     } catch (e) {
-      setState(() => err = e.toString());
-    } finally {
-      setState(() => busy = false);
-    }
-  }
-
-  Future<void> _sendCodeForReset() async {
-    setState(() {
-      busy = true;
-      err = null;
-    });
-    try {
-      if (!_resetKey.currentState!.validate()) return;
-      final email = _buildEmail(plain: resetEmailPlainCtrl, prefix: resetEmailPrefixCtrl, suffix: resetEmailSuffix);
-      if (email.isEmpty) throw Exception('邮箱不完整');
-
-      await XBoardApi.I.sendEmailCode(email: email, scene: 'reset_password');
-      setState(() => err = '验证码已发送，请查收邮箱');
-    } catch (e) {
-      setState(() => err = e.toString());
+      setState(() => msg = '注册失败：$e');
     } finally {
       setState(() => busy = false);
     }
@@ -334,41 +283,34 @@ class _AuthPageState extends State<AuthPage> {
   Future<void> _doReset() async {
     setState(() {
       busy = true;
-      err = null;
+      msg = null;
     });
-
     try {
+      if (guest.isEmailVerify != 1) {
+        throw Exception('当前站点未开启邮箱验证，请联系管理员重置密码。');
+      }
       if (!_resetKey.currentState!.validate()) return;
 
       final email = _buildEmail(plain: resetEmailPlainCtrl, prefix: resetEmailPrefixCtrl, suffix: resetEmailSuffix);
       if (email.isEmpty) throw Exception('邮箱不完整');
 
-      if (guest.isEmailVerify != 1) {
-        throw Exception('当前站点未开启邮箱验证，请联系管理员重置密码。');
-      }
-
       final code = resetCodeCtrl.text.trim();
       if (code.isEmpty) throw Exception('请输入验证码');
 
-      await XBoardApi.I.resetPassword(
-        email: email,
-        password: resetPwd1Ctrl.text,
-        emailCode: code,
-      );
+      await XBoardApi.I.resetPassword(email: email, password: resetPwd1Ctrl.text, emailCode: code);
 
       setState(() {
         tab = AuthTab.login;
-        err = '密码重置成功，请登录';
+        msg = '密码重置成功，请登录';
         loginEmailCtrl.text = email;
       });
     } catch (e) {
-      setState(() => err = e.toString());
+      setState(() => msg = '$e');
     } finally {
       setState(() => busy = false);
     }
   }
 
-  // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
     final title = switch (tab) {
@@ -381,89 +323,59 @@ class _AuthPageState extends State<AuthPage> {
       canPop: !widget.force,
       child: Scaffold(
         backgroundColor: const Color(0xFF0B0F17),
+        appBar: AppBar(
+          title: Text(title),
+          actions: [
+            IconButton(
+              tooltip: '刷新',
+              onPressed: busy ? null : _reloadAll,
+              icon: const Icon(Icons.refresh),
+            ),
+            TextButton(onPressed: () => _openExternal(XBoardApi.I.supportUrl), child: const Text('客服')),
+            TextButton(onPressed: () => _openExternal(XBoardApi.I.websiteUrl), child: const Text('官网')),
+          ],
+        ),
         body: SafeArea(
           child: Center(
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 460),
+              constraints: const BoxConstraints(maxWidth: 480),
               child: Padding(
-                padding: const EdgeInsets.all(18),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Row(
+                padding: const EdgeInsets.all(16),
+                child: Card(
+                  color: const Color(0xFF121827),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
                       children: [
-                        Text(title, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
-                        const Spacer(),
+                        if (loadingGuest)
+                          Row(
+                            children: [
+                              const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                              const SizedBox(width: 10),
+                              Text('联通检测中…', style: TextStyle(color: Colors.white.withOpacity(0.7))),
+                            ],
+                          )
+                        else
+                          Row(
+                            children: [
+                              Icon(Icons.check_circle, color: Colors.greenAccent.withOpacity(0.9)),
+                              const SizedBox(width: 8),
+                              Text(msg ?? '联通正常'),
+                            ],
+                          ),
+                        const SizedBox(height: 12),
 
-                        IconButton(
-                          tooltip: '刷新',
-                          onPressed: busy ? null : _reloadAll,
-                          icon: const Icon(Icons.refresh),
-                        ),
-                        const SizedBox(width: 6),
+                        Expanded(child: _buildTabBody()),
+                        const SizedBox(height: 8),
 
-                        TextButton(
-                          onPressed: () => _openExternal(XBoardApi.I.supportUrl),
-                          child: const Text('客服'),
-                        ),
-                        const SizedBox(width: 6),
-
-                        TextButton(
-                          onPressed: () => _openExternal(XBoardApi.I.websiteUrl),
-                          child: const Text('官网'),
-                        ),
+                        if (msg != null && !loadingGuest)
+                          Text(
+                            msg!,
+                            style: TextStyle(color: msg!.contains('成功') || msg!.contains('正常') ? Colors.greenAccent : Colors.redAccent),
+                          ),
                       ],
                     ),
-                    const SizedBox(height: 12),
-
-                    Card(
-                      color: const Color(0xFF121827),
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: AnimatedSwitcher(
-                          duration: const Duration(milliseconds: 180),
-                          child: switch (tab) {
-                            AuthTab.login => _buildLogin(),
-                            AuthTab.register => _buildRegister(),
-                            AuthTab.reset => _buildReset(),
-                          },
-                        ),
-                      ),
-                    ),
-
-                    if (err != null) ...[
-                      const SizedBox(height: 12),
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: (err!.contains('成功') || err!.contains('已发送') ? Colors.green : Colors.red)
-                              .withOpacity(0.12),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(
-                            color: (err!.contains('成功') || err!.contains('已发送') ? Colors.green : Colors.red)
-                                .withOpacity(0.3),
-                          ),
-                        ),
-                        child: Text(
-                          err!,
-                          style: TextStyle(
-                            color: err!.contains('成功') || err!.contains('已发送')
-                                ? Colors.greenAccent
-                                : Colors.redAccent,
-                          ),
-                        ),
-                      ),
-                    ],
-
-                    const Spacer(),
-
-                    if (widget.force)
-                      Text(
-                        '需要登录后才能继续',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.white.withOpacity(0.55)),
-                      ),
-                  ],
+                  ),
                 ),
               ),
             ),
@@ -473,18 +385,26 @@ class _AuthPageState extends State<AuthPage> {
     );
   }
 
-  Widget _buildLogin() {
+  Widget _buildTabBody() {
+    return SingleChildScrollView(
+      child: switch (tab) {
+        AuthTab.login => _loginBody(),
+        AuthTab.register => _registerBody(),
+        AuthTab.reset => _resetBody(),
+      },
+    );
+  }
+
+  Widget _loginBody() {
     return Form(
       key: _loginKey,
       child: Column(
-        key: const ValueKey('login'),
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           TextFormField(
             controller: loginEmailCtrl,
             enabled: !busy,
-            keyboardType: TextInputType.emailAddress,
-            decoration: const InputDecoration(labelText: '邮箱', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '邮箱'),
             validator: _vEmailPlain,
           ),
           const SizedBox(height: 12),
@@ -492,56 +412,38 @@ class _AuthPageState extends State<AuthPage> {
             controller: loginPwdCtrl,
             enabled: !busy,
             obscureText: true,
-            decoration: const InputDecoration(labelText: '密码', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '密码（至少8位）'),
             validator: _vPwdMin8,
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 8),
           Row(
             children: [
-              Checkbox(
-                value: rememberPwd,
-                onChanged: busy ? null : (v) => setState(() => rememberPwd = v ?? true),
-              ),
+              Checkbox(value: rememberPwd, onChanged: busy ? null : (v) => setState(() => rememberPwd = v ?? true)),
               const Text('记住密码'),
               const Spacer(),
-              if (loadingGuest) Text('检测中…', style: TextStyle(color: Colors.white.withOpacity(0.6))),
+              TextButton(onPressed: busy ? null : () => setState(() => tab = AuthTab.reset), child: const Text('忘记密码？')),
+              TextButton(onPressed: busy ? null : () => setState(() => tab = AuthTab.register), child: const Text('去注册')),
             ],
           ),
           const SizedBox(height: 10),
           SizedBox(
-            width: double.infinity,
             height: 48,
             child: ElevatedButton(
               onPressed: busy ? null : _doLogin,
               child: busy
-                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                   : const Text('登录'),
             ),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              TextButton(
-                onPressed: busy ? null : () => setState(() => tab = AuthTab.reset),
-                child: Text('忘记密码？', style: TextStyle(color: Colors.white.withOpacity(0.75))),
-              ),
-              const Spacer(),
-              TextButton(
-                onPressed: busy ? null : () => setState(() => tab = AuthTab.register),
-                child: Text('没有账号？去注册', style: TextStyle(color: Colors.white.withOpacity(0.75))),
-              ),
-            ],
           ),
         ],
       ),
     );
   }
 
-  Widget _buildRegister() {
+  Widget _registerBody() {
     return Form(
       key: _regKey,
       child: Column(
-        key: const ValueKey('register'),
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _emailField(
@@ -559,9 +461,9 @@ class _AuthPageState extends State<AuthPage> {
               children: [
                 Expanded(
                   child: TextFormField(
-                    controller: regEmailCodeCtrl,
+                    controller: regCodeCtrl,
                     enabled: !busy,
-                    decoration: const InputDecoration(labelText: '邮箱验证码', border: OutlineInputBorder()),
+                    decoration: const InputDecoration(labelText: '邮箱验证码'),
                     validator: (v) => (v ?? '').trim().isEmpty ? '请输入验证码' : null,
                   ),
                 ),
@@ -570,7 +472,17 @@ class _AuthPageState extends State<AuthPage> {
                   width: 120,
                   height: 48,
                   child: OutlinedButton(
-                    onPressed: busy ? null : _sendCodeForRegister,
+                    onPressed: busy
+                        ? null
+                        : () {
+                            if (!_regKey.currentState!.validate()) return;
+                            final email = _buildEmail(plain: regEmailPlainCtrl, prefix: regEmailPrefixCtrl, suffix: regEmailSuffix);
+                            if (email.isEmpty) {
+                              setState(() => msg = '邮箱不完整');
+                              return;
+                            }
+                            _sendCode(email, 'register');
+                          },
                     child: const Text('发送验证码'),
                   ),
                 ),
@@ -583,21 +495,19 @@ class _AuthPageState extends State<AuthPage> {
             controller: regPwd1Ctrl,
             enabled: !busy,
             obscureText: true,
-            decoration: const InputDecoration(labelText: '密码（至少8位）', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '密码（至少8位）'),
             onChanged: (_) => setState(() => regPwdTouched = true),
             validator: _vPwdMin8,
           ),
-          if (regPwdTouched && regPwd1Ctrl.text.length < 8) ...[
-            const SizedBox(height: 6),
-            Text('密码至少 8 位', style: TextStyle(color: Colors.redAccent.withOpacity(0.9))),
-          ],
-          const SizedBox(height: 12),
+          if (regPwdTouched && regPwd1Ctrl.text.length < 8)
+            const Padding(padding: EdgeInsets.only(top: 6), child: Text('密码至少 8 位', style: TextStyle(color: Colors.redAccent))),
 
+          const SizedBox(height: 12),
           TextFormField(
             controller: regPwd2Ctrl,
             enabled: !busy,
             obscureText: true,
-            decoration: const InputDecoration(labelText: '确认密码', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '确认密码'),
             validator: (v) => _vPwd2Match(v, regPwd1Ctrl),
           ),
           const SizedBox(height: 12),
@@ -605,7 +515,7 @@ class _AuthPageState extends State<AuthPage> {
           TextFormField(
             controller: regInviteCtrl,
             enabled: !busy,
-            decoration: const InputDecoration(labelText: '邀请码（可选）', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '邀请码（可选）'),
           ),
           const SizedBox(height: 12),
 
@@ -614,33 +524,22 @@ class _AuthPageState extends State<AuthPage> {
             child: ElevatedButton(
               onPressed: busy ? null : _doRegister,
               child: busy
-                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                   : const Text('注册'),
             ),
           ),
-          const SizedBox(height: 10),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton(
-              onPressed: busy ? null : () => setState(() => tab = AuthTab.login),
-              child: Text('返回登录', style: TextStyle(color: Colors.white.withOpacity(0.75))),
-            ),
-          ),
+          TextButton(onPressed: busy ? null : () => setState(() => tab = AuthTab.login), child: const Text('返回登录')),
         ],
       ),
     );
   }
 
-  Widget _buildReset() {
+  Widget _resetBody() {
     if (guest.isEmailVerify != 1) {
       return Column(
-        key: const ValueKey('reset_disabled'),
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text(
-            '当前站点未开启邮箱验证，请联系管理员重置密码。',
-            style: TextStyle(color: Colors.white.withOpacity(0.75)),
-          ),
+          const Text('当前站点未开启邮箱验证，请联系管理员重置密码。'),
           const SizedBox(height: 12),
           SizedBox(
             height: 48,
@@ -656,7 +555,6 @@ class _AuthPageState extends State<AuthPage> {
     return Form(
       key: _resetKey,
       child: Column(
-        key: const ValueKey('reset'),
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _emailField(
@@ -675,7 +573,7 @@ class _AuthPageState extends State<AuthPage> {
                 child: TextFormField(
                   controller: resetCodeCtrl,
                   enabled: !busy,
-                  decoration: const InputDecoration(labelText: '邮箱验证码', border: OutlineInputBorder()),
+                  decoration: const InputDecoration(labelText: '邮箱验证码'),
                   validator: (v) => (v ?? '').trim().isEmpty ? '请输入验证码' : null,
                 ),
               ),
@@ -684,7 +582,18 @@ class _AuthPageState extends State<AuthPage> {
                 width: 120,
                 height: 48,
                 child: OutlinedButton(
-                  onPressed: busy ? null : _sendCodeForReset,
+                  onPressed: busy
+                      ? null
+                      : () {
+                          if (!_resetKey.currentState!.validate()) return;
+                          final email =
+                              _buildEmail(plain: resetEmailPlainCtrl, prefix: resetEmailPrefixCtrl, suffix: resetEmailSuffix);
+                          if (email.isEmpty) {
+                            setState(() => msg = '邮箱不完整');
+                            return;
+                          }
+                          _sendCode(email, 'reset_password');
+                        },
                   child: const Text('发送验证码'),
                 ),
               ),
@@ -696,21 +605,19 @@ class _AuthPageState extends State<AuthPage> {
             controller: resetPwd1Ctrl,
             enabled: !busy,
             obscureText: true,
-            decoration: const InputDecoration(labelText: '新密码（至少8位）', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '新密码（至少8位）'),
             onChanged: (_) => setState(() => resetPwdTouched = true),
             validator: _vPwdMin8,
           ),
-          if (resetPwdTouched && resetPwd1Ctrl.text.length < 8) ...[
-            const SizedBox(height: 6),
-            Text('密码至少 8 位', style: TextStyle(color: Colors.redAccent.withOpacity(0.9))),
-          ],
-          const SizedBox(height: 12),
+          if (resetPwdTouched && resetPwd1Ctrl.text.length < 8)
+            const Padding(padding: EdgeInsets.only(top: 6), child: Text('密码至少 8 位', style: TextStyle(color: Colors.redAccent))),
 
+          const SizedBox(height: 12),
           TextFormField(
             controller: resetPwd2Ctrl,
             enabled: !busy,
             obscureText: true,
-            decoration: const InputDecoration(labelText: '确认新密码', border: OutlineInputBorder()),
+            decoration: const InputDecoration(labelText: '确认新密码'),
             validator: (v) => _vPwd2Match(v, resetPwd1Ctrl),
           ),
           const SizedBox(height: 12),
@@ -720,20 +627,5 @@ class _AuthPageState extends State<AuthPage> {
             child: ElevatedButton(
               onPressed: busy ? null : _doReset,
               child: busy
-                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Text('重置密码'),
-            ),
-          ),
-          const SizedBox(height: 10),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton(
-              onPressed: busy ? null : () => setState(() => tab = AuthTab.login),
-              child: Text('返回登录', style: TextStyle(color: Colors.white.withOpacity(0.75))),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Text
