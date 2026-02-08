@@ -1,7 +1,10 @@
 {
-  "api_prefix": "/api/v1",
+  "apiPrefix": "/api/v1",
   "domains": [
     "https://com.android22.com",
-    "https://backup.example.com"
-  ]
+    "https://backup1.android22.com",
+    "https://backup2.android22.com"
+  ],
+  "supportUrl": "https://t.me/your_support",
+  "websiteUrl": "https://com.android22.com"
 }
