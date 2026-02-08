@@ -1,104 +1,79 @@
-import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'app_storage.dart';
 import 'config_manager.dart';
 
-class DomainRacerResult {
-  final RemoteConfigData config;
-  final String baseUrl; // 最终选中的域名（不含 apiPrefix）
-  DomainRacerResult({required this.config, required this.baseUrl});
+class ResolvedDomain {
+  final String baseUrl; // https://fastest.com
+  final RemoteConfig config;
+  final int latencyMs;
+
+  const ResolvedDomain({required this.baseUrl, required this.config, required this.latencyMs});
 }
 
 class DomainRacer {
   static final DomainRacer I = DomainRacer._();
   DomainRacer._();
 
-  // 保守值（你要改也只改这里）
-  static const int maxConcurrency = 4;
-  static const Duration probeTimeout = Duration(milliseconds: 1500);
-  static const Duration fetchRemoteTimeout = Duration(seconds: 6);
+  static const Duration cacheTtl = Duration(minutes: 30);
+  static const Duration testTimeout = Duration(seconds: 3);
 
-  Future<DomainRacerResult> resolve() async {
-    // 1) 优先加载远程 config；失败则用缓存 config
-    RemoteConfigData cfg;
-    try {
-      cfg = await ConfigManager.I.fetchRemoteConfig(timeout: fetchRemoteTimeout);
-      await AppStorage.I.setJson(AppStorage.kRemoteConfigCache, cfg.toJson());
-    } catch (_) {
-      final cached = AppStorage.I.getJson(AppStorage.kRemoteConfigCache);
-      if (cached == null) rethrow;
-      cfg = RemoteConfigData.fromJson(cached);
+  Future<ResolvedDomain> resolve(RemoteConfig config, {bool forceRefresh = false}) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final cachedAt = AppStorage.I.getInt(AppStorage.kResolvedDomainCachedAt);
+    final cachedBase = AppStorage.I.getString(AppStorage.kResolvedDomainBase);
+
+    if (!forceRefresh && cachedAt > 0 && cachedBase.isNotEmpty && (now - cachedAt) < cacheTtl.inMilliseconds) {
+      return ResolvedDomain(baseUrl: cachedBase, config: config, latencyMs: AppStorage.I.getInt(AppStorage.kResolvedDomainLatency));
     }
 
-    if (cfg.domains.isEmpty) throw Exception('config.domains empty');
+    final domains = config.domains.map(_normalizeBase).toList();
+    final futures = domains.map((d) => _testOne(d, config.apiPrefix)).toList();
 
-    // 2) 优先尝试 bestDomain（避免每次都竞速）
-    final best = AppStorage.I.getString(AppStorage.kBestDomain).trim();
-    if (best.isNotEmpty && cfg.domains.contains(best)) {
-      final ok = await _probe(best, cfg.apiPrefix);
-      if (ok) return DomainRacerResult(config: cfg, baseUrl: best);
+    // 并发竞速：取最快成功
+    ResolvedDomain? best;
+    for (final f in futures) {
+      // 不 await 单个，会影响并发。这里用 Future.any + 手动收集更复杂
+      // 简化：全部 await 完再选最小（域名少时足够稳）
+    }
+    final results = await Future.wait(futures);
+
+    for (final r in results) {
+      if (r == null) continue;
+      if (best == null || r.latencyMs < best.latencyMs) best = r;
     }
 
-    // 3) 竞速（并发最多4）
-    final domains = cfg.domains.toList();
-    final winner = await _race(domains, cfg.apiPrefix);
-    if (winner == null) throw Exception('all domains probe failed');
+    if (best == null) {
+      throw Exception('所有域名联通测试失败');
+    }
 
-    await AppStorage.I.setString(AppStorage.kBestDomain, winner);
-    await AppStorage.I.setInt(AppStorage.kBestDomainTs, DateTime.now().millisecondsSinceEpoch);
-
-    return DomainRacerResult(config: cfg, baseUrl: winner);
+    await AppStorage.I.setString(AppStorage.kResolvedDomainBase, best.baseUrl);
+    await AppStorage.I.setInt(AppStorage.kResolvedDomainLatency, best.latencyMs);
+    await AppStorage.I.setInt(AppStorage.kResolvedDomainCachedAt, now);
+    return best;
   }
 
-  Future<bool> _probe(String domain, String apiPrefix) async {
+  String _normalizeBase(String s) {
+    var u = s.trim();
+    if (u.endsWith('/')) u = u.substring(0, u.length - 1);
+    return u;
+  }
+
+  Future<ResolvedDomain?> _testOne(String baseUrl, String apiPrefix) async {
+    final sw = Stopwatch()..start();
     try {
-      final u = Uri.parse('$domain$apiPrefix/guest/comm/config');
-      final resp = await http.get(u, headers: const {'Accept': 'application/json'}).timeout(probeTimeout);
-      if (resp.statusCode != 200) return false;
+      final uri = Uri.parse('$baseUrl$apiPrefix/guest/comm/config');
+      final resp = await http.get(uri).timeout(testTimeout);
+      if (resp.statusCode != 200) return null;
+
       final j = jsonDecode(resp.body);
-      return (j is Map) && (j['status']?.toString() == 'success');
+      if (j is! Map) return null;
+
+      sw.stop();
+      return ResolvedDomain(baseUrl: baseUrl, config: RemoteConfig(apiPrefix: apiPrefix, domains: [], supportUrl: '', websiteUrl: ''), latencyMs: sw.elapsedMilliseconds);
     } catch (_) {
-      return false;
+      return null;
     }
-  }
-
-  Future<String?> _race(List<String> domains, String apiPrefix) async {
-    final queue = List<String>.from(domains);
-    final completer = Completer<String?>();
-    int running = 0;
-    bool decided = false;
-
-    Future<void> runNext() async {
-      if (decided) return;
-      if (queue.isEmpty) {
-        if (running == 0 && !completer.isCompleted) completer.complete(null);
-        return;
-      }
-      final d = queue.removeAt(0);
-      running++;
-
-      () async {
-        final ok = await _probe(d, apiPrefix);
-        if (!decided && ok) {
-          decided = true;
-          if (!completer.isCompleted) completer.complete(d);
-        }
-      }().whenComplete(() {
-        running--;
-        if (!decided) {
-          runNext();
-          if (queue.isEmpty && running == 0 && !completer.isCompleted) completer.complete(null);
-        }
-      });
-    }
-
-    final start = (domains.length < maxConcurrency) ? domains.length : maxConcurrency;
-    for (int i = 0; i < start; i++) {
-      await runNext();
-    }
-
-    return completer.future;
   }
 }
