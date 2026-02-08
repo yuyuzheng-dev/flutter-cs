@@ -23,35 +23,38 @@ class DomainRacer {
     final now = DateTime.now().millisecondsSinceEpoch;
     final cachedAt = AppStorage.I.getInt(AppStorage.kResolvedDomainCachedAt);
     final cachedBase = AppStorage.I.getString(AppStorage.kResolvedDomainBase);
+    final cachedLatency = AppStorage.I.getInt(AppStorage.kResolvedDomainLatency);
 
     if (!forceRefresh && cachedAt > 0 && cachedBase.isNotEmpty && (now - cachedAt) < cacheTtl.inMilliseconds) {
-      return ResolvedDomain(baseUrl: cachedBase, config: config, latencyMs: AppStorage.I.getInt(AppStorage.kResolvedDomainLatency));
+      return ResolvedDomain(baseUrl: cachedBase, config: config, latencyMs: cachedLatency);
     }
 
     final domains = config.domains.map(_normalizeBase).toList();
-    final futures = domains.map((d) => _testOne(d, config.apiPrefix)).toList();
-
-    // 并发竞速：取最快成功
-    ResolvedDomain? best;
-    for (final f in futures) {
-      // 不 await 单个，会影响并发。这里用 Future.any + 手动收集更复杂
-      // 简化：全部 await 完再选最小（域名少时足够稳）
-    }
+    final futures = domains.map((d) => _testLatencyMs(d, config.apiPrefix)).toList();
     final results = await Future.wait(futures);
 
-    for (final r in results) {
-      if (r == null) continue;
-      if (best == null || r.latencyMs < best.latencyMs) best = r;
+    int bestIdx = -1;
+    int bestLatency = 1 << 30;
+
+    for (int i = 0; i < results.length; i++) {
+      final ms = results[i];
+      if (ms == null) continue;
+      if (ms < bestLatency) {
+        bestLatency = ms;
+        bestIdx = i;
+      }
     }
 
-    if (best == null) {
+    if (bestIdx < 0) {
       throw Exception('所有域名联通测试失败');
     }
 
-    await AppStorage.I.setString(AppStorage.kResolvedDomainBase, best.baseUrl);
-    await AppStorage.I.setInt(AppStorage.kResolvedDomainLatency, best.latencyMs);
+    final bestBase = domains[bestIdx];
+    await AppStorage.I.setString(AppStorage.kResolvedDomainBase, bestBase);
+    await AppStorage.I.setInt(AppStorage.kResolvedDomainLatency, bestLatency);
     await AppStorage.I.setInt(AppStorage.kResolvedDomainCachedAt, now);
-    return best;
+
+    return ResolvedDomain(baseUrl: bestBase, config: config, latencyMs: bestLatency);
   }
 
   String _normalizeBase(String s) {
@@ -60,7 +63,7 @@ class DomainRacer {
     return u;
   }
 
-  Future<ResolvedDomain?> _testOne(String baseUrl, String apiPrefix) async {
+  Future<int?> _testLatencyMs(String baseUrl, String apiPrefix) async {
     final sw = Stopwatch()..start();
     try {
       final uri = Uri.parse('$baseUrl$apiPrefix/guest/comm/config');
@@ -71,7 +74,7 @@ class DomainRacer {
       if (j is! Map) return null;
 
       sw.stop();
-      return ResolvedDomain(baseUrl: baseUrl, config: RemoteConfig(apiPrefix: apiPrefix, domains: [], supportUrl: '', websiteUrl: ''), latencyMs: sw.elapsedMilliseconds);
+      return sw.elapsedMilliseconds;
     } catch (_) {
       return null;
     }
