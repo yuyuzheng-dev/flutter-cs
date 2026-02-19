@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'app_storage.dart';
 import 'auth_page.dart';
 import 'xboard_api.dart';
+import 'store_page.dart';
 
 class HomePage extends StatefulWidget {
   final Map<String, dynamic>? initialSubscribeCache;
@@ -103,6 +104,21 @@ class _HomePageState extends State<HomePage> {
                           child: busy
                               ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                               : const Text('获取最新订阅'),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        height: 44,
+                        child: OutlinedButton.icon(
+                          onPressed: busy
+                              ? null
+                              : () {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(builder: (_) => const StorePage()),
+                                  );
+                                },
+                          icon: const Icon(Icons.storefront),
+                          label: const Text('进入商店'),
                         ),
                       ),
                     ],
