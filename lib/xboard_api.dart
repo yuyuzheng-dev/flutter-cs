@@ -302,12 +302,20 @@ class XBoardApi {
     dynamic data;
     try {
       data = await _post(
+<<<<<<< codex-5jlcba
         '/user/order/save',
+=======
+        '/user/order/create',
+>>>>>>> main
         data: jsonEncode(body),
       );
     } catch (_) {
       data = await _post(
+<<<<<<< codex-5jlcba
         '/user/order/create',
+=======
+        '/user/order/save',
+>>>>>>> main
         data: jsonEncode(body),
       );
     }
@@ -319,6 +327,7 @@ class XBoardApi {
 
   /// 获取支付方式列表
   Future<List<dynamic>> fetchPaymentMethods() async {
+<<<<<<< codex-5jlcba
     dynamic data;
     try {
       data = await _get('/user/payment/fetch');
@@ -326,6 +335,9 @@ class XBoardApi {
       data = await _get('/user/order/getPaymentMethod');
     }
 
+=======
+    final data = await _get('/user/order/getPaymentMethod');
+>>>>>>> main
     if (data is Map && data['data'] is List) {
       return data['data'] as List<dynamic>;
     }
