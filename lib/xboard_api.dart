@@ -248,10 +248,17 @@ class XBoardApi {
     return j;
   }
 
-  /// 获取余额信息
+  /// 获取余额信息（兼容不同后端实现）
   Future<Map<String, dynamic>> fetchBalance() async {
-    final data = await _get('/user/balance/fetch');
+    dynamic data;
+    try {
+      data = await _get('/user/getStat');
+    } catch (_) {
+      data = await _get('/user/balance/fetch');
+    }
+
     if (data is Map<String, dynamic>) return data;
+    if (data is Map) return Map<String, dynamic>.from(data);
     throw XBoardApiException('Unexpected balance response format', raw: data);
   }
 
@@ -287,10 +294,18 @@ class XBoardApi {
       body['coupon_code'] = couponCode;
     }
 
-    final data = await _post(
-      '/user/order/create',
-      data: jsonEncode(body),
-    );
+    dynamic data;
+    try {
+      data = await _post(
+        '/user/order/create',
+        data: jsonEncode(body),
+      );
+    } catch (_) {
+      data = await _post(
+        '/user/order/save',
+        data: jsonEncode(body),
+      );
+    }
 
     if (data is Map<String, dynamic>) return data;
     throw XBoardApiException('Unexpected createOrder response format', raw: data);
