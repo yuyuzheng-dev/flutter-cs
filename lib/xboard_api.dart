@@ -278,6 +278,9 @@ class XBoardApi {
     if (data is Map && data['data'] is List) {
       return data['data'] as List<dynamic>;
     }
+    if (data is Map && data['data'] is Map && data['data']['orders'] is List) {
+      return data['data']['orders'] as List<dynamic>;
+    }
     if (data is List) return data;
     throw XBoardApiException('Unexpected order list format', raw: data);
   }
@@ -285,10 +288,12 @@ class XBoardApi {
   /// 创建订单
   Future<Map<String, dynamic>> createOrder({
     required String planId,
+    required String period,
     String? couponCode,
   }) async {
     final body = <String, dynamic>{
-      'plan_id': planId,
+      'plan_id': int.tryParse(planId) ?? planId,
+      'period': period,
     };
     if (couponCode != null && couponCode.isNotEmpty) {
       body['coupon_code'] = couponCode;
@@ -297,27 +302,82 @@ class XBoardApi {
     dynamic data;
     try {
       data = await _post(
+<<<<<<< codex-5jlcba
+        '/user/order/save',
+=======
         '/user/order/create',
+>>>>>>> main
         data: jsonEncode(body),
       );
     } catch (_) {
       data = await _post(
+<<<<<<< codex-5jlcba
+        '/user/order/create',
+=======
         '/user/order/save',
+>>>>>>> main
         data: jsonEncode(body),
       );
     }
 
     if (data is Map<String, dynamic>) return data;
+    if (data is Map) return Map<String, dynamic>.from(data);
     throw XBoardApiException('Unexpected createOrder response format', raw: data);
   }
 
   /// 获取支付方式列表
   Future<List<dynamic>> fetchPaymentMethods() async {
+<<<<<<< codex-5jlcba
+    dynamic data;
+    try {
+      data = await _get('/user/payment/fetch');
+    } catch (_) {
+      data = await _get('/user/order/getPaymentMethod');
+    }
+
+=======
     final data = await _get('/user/order/getPaymentMethod');
+>>>>>>> main
     if (data is Map && data['data'] is List) {
       return data['data'] as List<dynamic>;
     }
     if (data is List) return data;
     throw XBoardApiException('Unexpected payment methods format', raw: data);
+  }
+
+  /// 验证优惠券
+  Future<Map<String, dynamic>> checkCoupon({
+    required String code,
+    required String planId,
+    required String period,
+  }) async {
+    final data = await _post(
+      '/user/coupon/check',
+      data: jsonEncode({
+        'code': code,
+        'plan_id': int.tryParse(planId) ?? planId,
+        'period': period,
+      }),
+    );
+    if (data is Map<String, dynamic>) return data;
+    if (data is Map) return Map<String, dynamic>.from(data);
+    throw XBoardApiException('Unexpected coupon check format', raw: data);
+  }
+
+  /// 发起支付
+  Future<Map<String, dynamic>> checkout({
+    required String tradeNo,
+    required String method,
+  }) async {
+    final data = await _post(
+      '/user/order/checkout',
+      data: jsonEncode({
+        'trade_no': tradeNo,
+        'method': method,
+      }),
+    );
+    if (data is Map<String, dynamic>) return data;
+    if (data is Map) return Map<String, dynamic>.from(data);
+    throw XBoardApiException('Unexpected checkout format', raw: data);
   }
 }
