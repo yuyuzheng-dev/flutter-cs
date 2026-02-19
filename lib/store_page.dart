@@ -30,25 +30,52 @@ class _StorePageState extends State<StorePage> {
       busy = true;
       err = null;
     });
-    try {
-      final results = await Future.wait<dynamic>([
-        XBoardApi.I.fetchBalance(),
-        XBoardApi.I.fetchPlans(),
-        XBoardApi.I.fetchUserOrders(),
-        XBoardApi.I.fetchPaymentMethods(),
-      ]);
 
-      setState(() {
-        balance = results[0] as Map<String, dynamic>;
-        plans = results[1] as List<dynamic>;
-        orders = results[2] as List<dynamic>;
-        paymentMethods = results[3] as List<dynamic>;
-      });
+    final errors = <String>[];
+
+    Map<String, dynamic>? nextBalance = balance;
+    List<dynamic> nextPlans = plans;
+    List<dynamic> nextOrders = orders;
+    List<dynamic> nextPaymentMethods = paymentMethods;
+
+    try {
+      nextBalance = await XBoardApi.I.fetchBalance();
     } catch (e) {
-      setState(() => err = e.toString());
-    } finally {
-      if (mounted) setState(() => busy = false);
+      errors.add('余额接口失败: $e');
+      nextBalance ??= const <String, dynamic>{};
     }
+
+    try {
+      nextPlans = await XBoardApi.I.fetchPlans();
+    } catch (e) {
+      errors.add('套餐接口失败: $e');
+      nextPlans = const [];
+    }
+
+    try {
+      nextOrders = await XBoardApi.I.fetchUserOrders();
+    } catch (e) {
+      errors.add('订单接口失败: $e');
+      nextOrders = const [];
+    }
+
+    try {
+      nextPaymentMethods = await XBoardApi.I.fetchPaymentMethods();
+    } catch (e) {
+      errors.add('支付方式接口失败: $e');
+      nextPaymentMethods = const [];
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      balance = nextBalance;
+      plans = nextPlans;
+      orders = nextOrders;
+      paymentMethods = nextPaymentMethods;
+      err = errors.isEmpty ? null : errors.join('\n');
+      busy = false;
+    });
   }
 
   Widget _jsonCard(String title, Object data) {
